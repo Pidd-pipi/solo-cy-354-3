@@ -36,12 +36,15 @@ func main() {
 		secret = "e2e-secret"
 	}
 
-	db, err := gorm.Open(sqlite.Open(dbPath+"?_busy_timeout=5000"), &gorm.Config{
+	db, err := gorm.Open(sqlite.Open(dbPath+"?_busy_timeout=10000&_journal_mode=WAL"), &gorm.Config{
 		Logger: gormlogger.Default.LogMode(gormlogger.Warn),
 	})
 	if err != nil {
 		slog.Error("open db", "error", err)
 		os.Exit(1)
+	}
+	if sqlDB, err := db.DB(); err == nil {
+		sqlDB.SetMaxOpenConns(10)
 	}
 	if err := db.AutoMigrate(
 		&model.User{}, &model.Product{}, &model.Conversation{}, &model.Message{},
@@ -75,6 +78,8 @@ func seed(db *gorm.DB) {
 		{Phone: "13700000002", PasswordHash: string(hash), Nickname: "卖家阿珍", Role: constants.UserRoleStudent, Campus: "西校区", CreditScore: 120},
 		{Phone: "13700000003", PasswordHash: string(hash), Nickname: "路人达人", Role: constants.UserRoleStudent, Campus: "南校区", CreditScore: 90},
 		{Phone: "13800000001", PasswordHash: string(adminHash), Nickname: "平台管理员", Role: constants.UserRoleAdmin, Campus: "东校区", CreditScore: 300},
+		{Phone: "13700000005", PasswordHash: string(hash), Nickname: "触底卖家", Role: constants.UserRoleStudent, Campus: "东校区", CreditScore: 4},
+		{Phone: "13700000006", PasswordHash: string(hash), Nickname: "触顶卖家", Role: constants.UserRoleStudent, Campus: "东校区", CreditScore: 298},
 	}
 	if err := db.Create(&users).Error; err != nil {
 		slog.Error("seed users", "error", err)
@@ -83,6 +88,8 @@ func seed(db *gorm.DB) {
 	products := []model.Product{
 		{SellerID: 2, Title: "差评场景商品", Price: 100, Category: constants.ProductCategoryBooks, Condition: "九成新", Campus: "西校区", TradeLocation: "三食堂", Status: constants.ProductStatusSold},
 		{SellerID: 2, Title: "好评场景商品", Price: 50, Category: constants.ProductCategoryBooks, Condition: "全新", Campus: "西校区", TradeLocation: "三食堂", Status: constants.ProductStatusSold},
+		{SellerID: 5, Title: "触底卖家的商品", Price: 30, Category: constants.ProductCategoryBooks, Condition: "九成新", Campus: "东校区", TradeLocation: "东门", Status: constants.ProductStatusSold},
+		{SellerID: 6, Title: "触顶卖家的商品", Price: 30, Category: constants.ProductCategoryBooks, Condition: "九成新", Campus: "东校区", TradeLocation: "东门", Status: constants.ProductStatusSold},
 	}
 	if err := db.Create(&products).Error; err != nil {
 		slog.Error("seed products", "error", err)
@@ -91,6 +98,8 @@ func seed(db *gorm.DB) {
 	orders := []model.TradeOrder{
 		{ProductID: 1, BuyerID: 1, SellerID: 2, Status: constants.TradeStatusCompleted},
 		{ProductID: 2, BuyerID: 1, SellerID: 2, Status: constants.TradeStatusCompleted},
+		{ProductID: 3, BuyerID: 1, SellerID: 5, Status: constants.TradeStatusCompleted},
+		{ProductID: 4, BuyerID: 1, SellerID: 6, Status: constants.TradeStatusCompleted},
 	}
 	if err := db.Create(&orders).Error; err != nil {
 		slog.Error("seed orders", "error", err)

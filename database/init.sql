@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS reviews (
   reviewee_id BIGINT UNSIGNED NOT NULL,
   rating VARCHAR(16) NOT NULL,
   content TEXT,
+  credit_delta INT NOT NULL DEFAULT 0 COMMENT '该评价实际造成的信誉分变化（已按[0,300]钳制），申诉通过时据此精确回滚',
   created_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
   UNIQUE KEY uniq_review_trade_reviewer (trade_id, reviewer_id),
   INDEX idx_reviews_reviewee (reviewee_id)

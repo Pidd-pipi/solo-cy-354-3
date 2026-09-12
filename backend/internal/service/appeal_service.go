@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/lp/campus-market/internal/constants"
@@ -16,14 +17,16 @@ import (
 // AppealStore is the data access contract for appeal rows.
 type AppealStore interface {
 	Transaction(ctx context.Context, fn func(txCtx context.Context) error) error
-	Create(ctx context.Context, a *model.ReviewAppeal) error
+	// CreateIfAbsent atomically inserts only when no appeal exists for the review.
+	CreateIfAbsent(ctx context.Context, a *model.ReviewAppeal) (bool, error)
 	FindByID(ctx context.Context, id uint) (*model.ReviewAppeal, error)
-	FindByReviewID(ctx context.Context, reviewID uint) (*model.ReviewAppeal, error)
-	FindByReviewIDForUpdate(ctx context.Context, reviewID uint) (*model.ReviewAppeal, error)
 	FindByIDForUpdate(ctx context.Context, id uint) (*model.ReviewAppeal, error)
 	ListByAppellant(ctx context.Context, appellantID uint) ([]model.ReviewAppeal, error)
 	ListByStatus(ctx context.Context, status string) ([]model.ReviewAppeal, error)
-	SaveDecision(ctx context.Context, a *model.ReviewAppeal) error
+	// DecideIfPending claims a pending appeal atomically (CAS); only one
+	// concurrent decision affects one row.
+	DecideIfPending(ctx context.Context, id uint, status string, adminID uint, comment string, reviewedAt time.Time) (int64, error)
+	MarkCreditRollback(ctx context.Context, id uint, delta int) error
 }
 
 // AppealReviewStore is the data access contract for reviews read by appeals.
@@ -45,8 +48,14 @@ func NewAppealService(appeals AppealStore, reviews AppealReviewStore, users User
 }
 
 // Submit files one appeal for a received review. Only the review receiver
-// (reviewee) can appeal, and each review may be appealed exactly once.
+// (reviewee) can appeal, and each review may be appealed exactly once. The
+// uniqueness is enforced atomically by the database unique index
+// (ON CONFLICT DO NOTHING), so concurrent submits never produce two rows.
 func (s *AppealService) Submit(ctx context.Context, appellant *model.User, req *dto.CreateAppealRequest) (*dto.AppealView, error) {
+	reason := strings.TrimSpace(req.Reason)
+	if len([]rune(reason)) < 2 {
+		return nil, util.NewAppError(400, constants.CodeValidation, constants.MsgAppealReasonRequired, nil)
+	}
 	rv, err := s.reviews.FindByID(ctx, req.ReviewID)
 	if err != nil {
 		if errors.Is(err, util.ErrNotFound) {
@@ -60,15 +69,17 @@ func (s *AppealService) Submit(ctx context.Context, appellant *model.User, req *
 	}
 	a := &model.ReviewAppeal{
 		ReviewID: rv.ID, AppellantID: appellant.ID,
-		Reason: req.Reason, Status: constants.AppealStatusPending,
+		Reason: reason, Status: constants.AppealStatusPending,
 	}
 	if err := s.appeals.Transaction(ctx, func(txCtx context.Context) error {
-		if _, err := s.appeals.FindByReviewIDForUpdate(txCtx, rv.ID); err == nil {
-			return util.ErrConflict
-		} else if !errors.Is(err, util.ErrNotFound) {
+		created, err := s.appeals.CreateIfAbsent(txCtx, a)
+		if err != nil {
 			return err
 		}
-		return s.appeals.Create(txCtx, a)
+		if !created {
+			return util.ErrConflict
+		}
+		return nil
 	}); err != nil {
 		if errors.Is(err, util.ErrConflict) {
 			return nil, util.NewAppError(409, constants.CodeConflict, constants.MsgAppealAlreadyExists, nil)
@@ -135,14 +146,22 @@ func (s *AppealService) AdminList(ctx context.Context, status string, adminID ui
 	return views, nil
 }
 
-// Review applies the admin decision. Approval rolls back the credit change
-// caused by the underlying review (good +5 → -5, bad -10 → +10, medium 0);
-// rejection leaves the credit score untouched.
+// Review applies the admin decision. Approval rolls back the ACTUAL credit
+// change recorded on the review (reviews.credit_delta, already clamped at
+// creation), so a review that changed the score by only +2 near the ceiling is
+// restored by -2 rather than the nominal +5. Rejection leaves the score
+// untouched. The status flip is a compare-and-swap
+// (UPDATE ... WHERE status='pending'), so concurrent reviews of the same
+// appeal have exactly one winner; losers get a business conflict and never
+// mutate credit.
 func (s *AppealService) Review(ctx context.Context, admin *model.User, appealID uint, req *dto.ReviewAppealRequest) (*dto.AppealView, error) {
 	if !constants.IsAppealAction(req.Action) {
 		return nil, util.NewAppError(400, constants.CodeBadRequest, constants.MsgAppealActionInvalid, nil)
 	}
-	var result *model.ReviewAppeal
+	newStatus := constants.AppealStatusApproved
+	if req.Action == constants.AppealActionReject {
+		newStatus = constants.AppealStatusRejected
+	}
 	var rv *model.Review
 	err := s.appeals.Transaction(ctx, func(txCtx context.Context) error {
 		a, err := s.appeals.FindByIDForUpdate(txCtx, appealID)
@@ -152,53 +171,53 @@ func (s *AppealService) Review(ctx context.Context, admin *model.User, appealID 
 			}
 			return err
 		}
-		if a.Status != constants.AppealStatusPending {
-			return util.NewAppError(409, constants.CodeConflict, constants.MsgAppealNotPending, nil)
-		}
 		review, err := s.reviews.FindByID(txCtx, a.ReviewID)
 		if err != nil {
 			return fmt.Errorf("appeal[id=%d] review lookup: %w", a.ID, err)
 		}
 		rv = review
-		now := time.Now()
-		adminID := admin.ID
-		a.AdminID = &adminID
-		a.ReviewComment = req.Comment
-		a.ReviewedAt = &now
-		switch req.Action {
-		case constants.AppealActionApprove:
-			a.Status = constants.AppealStatusApproved
-			rollback := -util.CreditDelta(review.Rating)
-			a.CreditDelta = rollback
+		// Claim the appeal atomically; if another concurrent decision already
+		// flipped it, affected==0 and we return without touching credit.
+		affected, err := s.appeals.DecideIfPending(txCtx, a.ID, newStatus, admin.ID, strings.TrimSpace(req.Comment), time.Now())
+		if err != nil {
+			return fmt.Errorf("appeal[id=%d] decide: %w", a.ID, err)
+		}
+		if affected == 0 {
+			return util.ErrConflict
+		}
+		if req.Action == constants.AppealActionApprove {
+			// Restore exactly what the review really changed (may differ from
+			// the nominal rating delta near the 0/300 bounds).
+			rollback := -review.CreditDelta
 			if rollback != 0 {
 				if err := s.users.AddCredit(txCtx, review.RevieweeID, rollback); err != nil {
 					return fmt.Errorf("appeal[id=%d] credit rollback: %w", a.ID, err)
 				}
-				a.CreditReversed = true
+				if err := s.appeals.MarkCreditRollback(txCtx, a.ID, rollback); err != nil {
+					return fmt.Errorf("appeal[id=%d] mark rollback: %w", a.ID, err)
+				}
 				s.logger.Info(fmt.Sprintf(constants.LogAppealCreditRollback, a.ID, review.RevieweeID, rollback))
 			}
-		case constants.AppealActionReject:
-			a.Status = constants.AppealStatusRejected
-			// Rejection keeps the original credit change: no score mutation.
-			a.CreditReversed = false
-			a.CreditDelta = 0
 		}
-		if err := s.appeals.SaveDecision(txCtx, a); err != nil {
-			return err
-		}
-		result = a
 		return nil
 	})
 	if err != nil {
 		var appErr *util.AppError
-		if errors.As(err, &appErr) {
+		switch {
+		case errors.As(err, &appErr):
 			return nil, err
+		case errors.Is(err, util.ErrConflict):
+			return nil, util.NewAppError(409, constants.CodeConflict, constants.MsgAppealNotPending, nil)
 		}
 		s.logger.Error(fmt.Sprintf(constants.LogAppealReviewFailed, appealID, admin.ID, err))
 		return nil, util.WrapAppError(fmt.Errorf("appeal[id=%d] review: %w", appealID, err), 500, constants.CodeInternalError, constants.MsgInternalError)
 	}
-	s.logger.Info(fmt.Sprintf(constants.LogAppealReviewSuccess, result.ID, result.ReviewID, req.Action, admin.ID))
-	return s.buildView(ctx, result, rv, "")
+	final, ferr := s.appeals.FindByID(ctx, appealID)
+	if ferr != nil {
+		return nil, util.WrapAppError(fmt.Errorf("appeal[id=%d] reload: %w", appealID, ferr), 500, constants.CodeInternalError, constants.MsgInternalError)
+	}
+	s.logger.Info(fmt.Sprintf(constants.LogAppealReviewSuccess, final.ID, final.ReviewID, req.Action, admin.ID))
+	return s.buildView(ctx, final, rv, "")
 }
 
 // buildView enriches an appeal with its appellant nickname and review snapshot.

@@ -189,7 +189,9 @@ cy-354/
 
 - **提交申诉**：只有评价接收方（`reviewee`，即信誉分被改变的一方）可以对自己收到的评价提交申诉；评价人与第三方均返回 403。每条评价只能申诉一次（`review_appeals.review_id` 唯一索引 + 事务内行锁双重保证），重复申诉返回 409。
 - **进度查询**：申诉人可通过 `GET /api/v1/appeals/me` 或 `GET /api/v1/appeals/:id` 查询状态（待审核/已通过/已驳回）、审核备注与信誉分处理结果；非发起人查询单条申诉返回 403。
-- **管理员审核**：管理员在申诉队列中按状态筛选并审核。`approve` 在同一数据库事务内**撤销该评价带来的信誉分变化**（好评 +5 扣回、差评 −10 补回、中评 0 无操作），并记录 `credit_delta`/`credit_reversed` 审计字段；`reject` 不做任何分数变动。已审核申诉不可二次审核（409）。
+- **管理员审核**：管理员在申诉队列中按状态筛选并审核。`approve` 在同一数据库事务内**撤销该评价实际造成的信誉分变化**：评价创建时即把按 [0,300] 钳制后**真正生效**的 delta 记录在 `reviews.credit_delta`（例如 4 分收到差评只扣 4、298 分收到好评只加 2），回滚时精确取反该值，而不是名义上的 ±5/±10；`reject` 不做任何分数变动。状态流转使用 `UPDATE ... WHERE status='pending'` 比较并交换，并发审核只有一个生效，已处理申诉再提交返回 409。
+- **并发安全**：提交侧用唯一索引 + `INSERT ... ON CONFLICT DO NOTHING`，并发重复提交恰好一条成功、其余返回明确业务冲突（409，`该评价已申诉，每条评价只能申诉一次`）；仓储事务在遇到 SQLite 立即锁 / MySQL 死锁(1213)、锁等待超时(1205) 时退避重试，配合 CAS 保证提交、审核、回滚在并发下均单次生效。
+- **输入校验**：申诉理由在 service 层 `TrimSpace` 后按有效字符判定，纯空格/制表符/换行一律拒绝（400，业务码 42200）。
 
 全栈贯穿文件（实体 ReviewAppeal）：`database/init.sql` → `model/review_appeal.go` → `repository/review_appeal_repository.go` → `service/appeal_service.go` → `handler/appeal_handler.go` → `router/appeals.go` → `frontend/src/api/appeal.ts` → `constants/appeal.ts` → `pages/MyAppeals.vue`（学生提交+进度）/ `pages/AdminAppeals.vue`（管理员审核）。
 
@@ -198,14 +200,24 @@ cy-354/
 无需 MySQL/Docker 的真实 HTTP 全链路验证（SQLite 落盘 + 生产同款 Gin 路由/中间件）：
 
 ```bash
-# 1) 启动真实 TCP 服务（:29514，自动建表+播种 4 个账号/2 笔已完成订单）
+# 1) 启动真实 TCP 服务（:29514，自动建表+播种 6 个账号/4 笔已完成订单，含触底 4 分、触顶 298 分账号）
 cd backend/e2e
 rm -f /tmp/e2e_campus.db   # 验证脚本要求全新数据库（脚本本身不做清理）
 go run -tags realserver ./cmd/realserver          # DB_PATH/PORT/JWT_SECRET 可用环境变量覆盖
 
-# 2) 另开终端执行 29 项断言（三条链路 + 权限/唯一性/分数回滚）
-bash backend/e2e/verify_appeal.sh                 # 期望末行 RESULT: PASS=29 FAIL=0
+# 2) 另开终端执行 49 项断言（三条链路 + 权限/唯一性/空白理由/触底触顶/并发）
+bash backend/e2e/verify_appeal.sh                 # 期望末行 RESULT: PASS=49 FAIL=0
 ```
+
+覆盖的边界与并发场景：
+
+- 纯空格/制表符/换行理由返回 400（业务码 42200），合法理由两端空格被裁剪存储；
+- 10 个并发提交同一评价申诉：恰好 1 条 200、9 条 409，库中仅 1 行（唯一索引 `ON CONFLICT DO NOTHING`）；
+- 10 个并发管理员审核：恰好 1 次 200、9 次 409，信誉分回滚仅执行一次（`UPDATE ... WHERE status='pending'` CAS）；
+- 并发混合 approve/reject 也只有一个决策生效；
+- 触底：4 分收到差评实际只扣 4（`reviews.credit_delta=-4`），申诉通过只恢复 +4（0→4，而非名义 +10）；
+- 触顶：298 分收到好评实际只加 2，申诉通过只恢复 −2（300→298，而非名义 −5）；驳回则分数不变；
+- 仓储事务对 SQLite `database is locked` / MySQL 死锁(1213)、锁等待超时(1205) 自动退避重试，配合 CAS 保证并发下业务效果单次生效。
 
 标准 Go 测试（表驱动单测 + httptest 全链路）：
 

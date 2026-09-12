@@ -2,9 +2,11 @@ package repository
 
 import (
 	"context"
+	"time"
 
 	"github.com/lp/campus-market/internal/model"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // ReviewAppealRepository persists review appeal rows.
@@ -22,35 +24,23 @@ func (r *ReviewAppealRepository) Transaction(ctx context.Context, fn func(txCtx 
 	return Transaction(ctx, r.db, fn)
 }
 
-// Create inserts a new appeal.
-func (r *ReviewAppealRepository) Create(ctx context.Context, a *model.ReviewAppeal) error {
-	return db(ctx, r.db).Create(a).Error
+// CreateIfAbsent atomically inserts an appeal only when none exists for the
+// review yet. It relies on the unique index on review_id with
+// INSERT ... ON CONFLICT DO NOTHING, so concurrent submitters serialize at the
+// database: exactly one row is created (created=true); losers get
+// created=false instead of a duplicate-key error.
+func (r *ReviewAppealRepository) CreateIfAbsent(ctx context.Context, a *model.ReviewAppeal) (created bool, err error) {
+	res := db(ctx, r.db).Clauses(clause.OnConflict{DoNothing: true}).Create(a)
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected == 1, nil
 }
 
 // FindByID returns the appeal with the given id.
 func (r *ReviewAppealRepository) FindByID(ctx context.Context, id uint) (*model.ReviewAppeal, error) {
 	var a model.ReviewAppeal
 	err := db(ctx, r.db).First(&a, id).Error
-	if err != nil {
-		return nil, normalizeError(err)
-	}
-	return &a, nil
-}
-
-// FindByReviewID returns the appeal filed for the given review, if any.
-func (r *ReviewAppealRepository) FindByReviewID(ctx context.Context, reviewID uint) (*model.ReviewAppeal, error) {
-	var a model.ReviewAppeal
-	err := db(ctx, r.db).Where("review_id = ?", reviewID).First(&a).Error
-	if err != nil {
-		return nil, normalizeError(err)
-	}
-	return &a, nil
-}
-
-// FindByReviewIDForUpdate returns the appeal with a row lock, valid inside a tx.
-func (r *ReviewAppealRepository) FindByReviewIDForUpdate(ctx context.Context, reviewID uint) (*model.ReviewAppeal, error) {
-	var a model.ReviewAppeal
-	err := lockForUpdate(db(ctx, r.db)).Where("review_id = ?", reviewID).First(&a).Error
 	if err != nil {
 		return nil, normalizeError(err)
 	}
@@ -87,15 +77,26 @@ func (r *ReviewAppealRepository) ListByStatus(ctx context.Context, status string
 	return items, err
 }
 
-// SaveDecision persists the admin decision and its audit fields.
-func (r *ReviewAppealRepository) SaveDecision(ctx context.Context, a *model.ReviewAppeal) error {
-	return db(ctx, r.db).Model(&model.ReviewAppeal{}).Where("id = ?", a.ID).
+// DecideIfPending atomically moves an appeal out of pending only while it is
+// still pending (CAS). It runs as a single UPDATE ... WHERE status='pending',
+// so concurrent admin reviews race on this one row: exactly one sees
+// affected=true and is allowed to mutate credit; the rest see false and must
+// return a business conflict without touching the score.
+func (r *ReviewAppealRepository) DecideIfPending(ctx context.Context, id uint, status string, adminID uint, comment string, reviewedAt time.Time) (affected int64, err error) {
+	res := db(ctx, r.db).Model(&model.ReviewAppeal{}).
+		Where("id = ? AND status = ?", id, "pending").
 		Updates(map[string]interface{}{
-			"status":          a.Status,
-			"admin_id":        a.AdminID,
-			"review_comment":  a.ReviewComment,
-			"credit_reversed": a.CreditReversed,
-			"credit_delta":    a.CreditDelta,
-			"reviewed_at":     a.ReviewedAt,
-		}).Error
+			"status":         status,
+			"admin_id":       adminID,
+			"review_comment": comment,
+			"reviewed_at":    reviewedAt,
+		})
+	return res.RowsAffected, res.Error
+}
+
+// MarkCreditRollback records the applied rollback amount after a successful
+// credit adjustment on an already-decided appeal.
+func (r *ReviewAppealRepository) MarkCreditRollback(ctx context.Context, id uint, delta int) error {
+	return db(ctx, r.db).Model(&model.ReviewAppeal{}).Where("id = ?", id).
+		Updates(map[string]interface{}{"credit_reversed": true, "credit_delta": delta}).Error
 }

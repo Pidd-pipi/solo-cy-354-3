@@ -26,3 +26,11 @@ func ClampCredit(score int) int {
 	}
 	return score
 }
+
+// AppliedDelta returns the score delta that would ACTUALLY take effect when a
+// user at score applies nominalDelta, after the [0,300] clamp. A +5 review at
+// score 298 applies +2 (and an appeal must restore +2, not +5); a -10 review
+// at score 4 applies -4.
+func AppliedDelta(score, nominalDelta int) int {
+	return ClampCredit(score+nominalDelta) - score
+}

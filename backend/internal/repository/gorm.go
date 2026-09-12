@@ -4,11 +4,17 @@ package repository
 import (
 	"context"
 	"errors"
+	"strings"
+	"time"
 
 	"github.com/lp/campus-market/internal/util"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
+
+// maxTxRetries bounds retry attempts for serialization failures (SQLite
+// SQLITE_LOCKED / MySQL deadlock 1213 / lock-wait timeout 1205).
+const maxTxRetries = 8
 
 // lockForUpdate applies SELECT ... FOR UPDATE on transactional dialects
 // (MySQL) and is a no-op elsewhere (SQLite tests).
@@ -38,11 +44,47 @@ func db(ctx context.Context, fallback *gorm.DB) *gorm.DB {
 }
 
 // Transaction runs fn inside a GORM transaction. The transaction handle is
-// injected into txCtx so all repository writes participate atomically.
+// injected into txCtx so all repository writes participate atomically. When
+// the database reports a serialization failure (SQLite immediate
+// lock/deadlock, or MySQL deadlock/lock-wait timeout), the whole unit of work
+// is retried with bounded backoff; compare-and-swap guards inside fn
+// (CreateIfAbsent / DecideIfPending) make retries safe: only one concurrent
+// unit of work can claim the row, so business effects still apply once.
 func Transaction(ctx context.Context, database *gorm.DB, fn func(txCtx context.Context) error) error {
-	return database.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		return fn(WithTx(ctx, tx))
-	})
+	var err error
+	for attempt := 0; attempt < maxTxRetries; attempt++ {
+		err = database.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			return fn(WithTx(ctx, tx))
+		})
+		if err == nil || !isLockError(err) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(attempt+1) * 5 * time.Millisecond):
+		}
+	}
+	return err
+}
+
+// isLockError reports whether err is a dialect-level lock/deadlock failure
+// that justifies retrying the whole transaction.
+func isLockError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "database is locked"), strings.Contains(msg, "database table is locked"):
+		// SQLite SQLITE_BUSY/SQLITE_LOCKED under concurrent WAL writers.
+		return true
+	case strings.Contains(msg, "deadlock found"), strings.Contains(msg, "lock wait timeout"):
+		// MySQL Error 1213 / 1205.
+		return true
+	default:
+		return false
+	}
 }
 
 // normalizeError converts GORM errors into sentinel repository errors.

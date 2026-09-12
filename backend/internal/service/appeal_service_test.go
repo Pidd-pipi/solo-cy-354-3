@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,8 +14,11 @@ import (
 	"github.com/lp/campus-market/internal/util"
 )
 
-// fakeAppealStore is an in-memory AppealStore for service tests.
+// fakeAppealStore is an in-memory AppealStore for service tests. It models the
+// real repository's atomic guards (unique review_id + CAS on pending) with a
+// mutex, so concurrent service calls behave like they would against MySQL.
 type fakeAppealStore struct {
+	mu      sync.Mutex
 	appeals map[uint]*model.ReviewAppeal
 	nextID  uint
 }
@@ -27,16 +31,25 @@ func (f *fakeAppealStore) Transaction(_ context.Context, fn func(txCtx context.C
 	return fn(context.Background())
 }
 
-func (f *fakeAppealStore) Create(_ context.Context, a *model.ReviewAppeal) error {
+func (f *fakeAppealStore) CreateIfAbsent(_ context.Context, a *model.ReviewAppeal) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, ex := range f.appeals {
+		if ex.ReviewID == a.ReviewID {
+			return false, nil
+		}
+	}
 	a.ID = f.nextID
 	f.nextID++
 	a.CreatedAt = time.Now()
 	cp := *a
 	f.appeals[a.ID] = &cp
-	return nil
+	return true, nil
 }
 
 func (f *fakeAppealStore) FindByID(_ context.Context, id uint) (*model.ReviewAppeal, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if a, ok := f.appeals[id]; ok {
 		cp := *a
 		return &cp, nil
@@ -44,25 +57,13 @@ func (f *fakeAppealStore) FindByID(_ context.Context, id uint) (*model.ReviewApp
 	return nil, util.ErrNotFound
 }
 
-func (f *fakeAppealStore) FindByReviewID(_ context.Context, reviewID uint) (*model.ReviewAppeal, error) {
-	for _, a := range f.appeals {
-		if a.ReviewID == reviewID {
-			cp := *a
-			return &cp, nil
-		}
-	}
-	return nil, util.ErrNotFound
-}
-
-func (f *fakeAppealStore) FindByReviewIDForUpdate(ctx context.Context, reviewID uint) (*model.ReviewAppeal, error) {
-	return f.FindByReviewID(ctx, reviewID)
-}
-
 func (f *fakeAppealStore) FindByIDForUpdate(ctx context.Context, id uint) (*model.ReviewAppeal, error) {
 	return f.FindByID(ctx, id)
 }
 
 func (f *fakeAppealStore) ListByAppellant(_ context.Context, appellantID uint) ([]model.ReviewAppeal, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	var out []model.ReviewAppeal
 	for _, a := range f.appeals {
 		if a.AppellantID == appellantID {
@@ -73,6 +74,8 @@ func (f *fakeAppealStore) ListByAppellant(_ context.Context, appellantID uint) (
 }
 
 func (f *fakeAppealStore) ListByStatus(_ context.Context, status string) ([]model.ReviewAppeal, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	var out []model.ReviewAppeal
 	for _, a := range f.appeals {
 		if status == "" || a.Status == status {
@@ -82,9 +85,29 @@ func (f *fakeAppealStore) ListByStatus(_ context.Context, status string) ([]mode
 	return out, nil
 }
 
-func (f *fakeAppealStore) SaveDecision(_ context.Context, a *model.ReviewAppeal) error {
-	cp := *a
-	f.appeals[a.ID] = &cp
+// DecideIfPending mirrors UPDATE ... WHERE status='pending': only the first
+// concurrent caller flips the row.
+func (f *fakeAppealStore) DecideIfPending(_ context.Context, id uint, status string, adminID uint, comment string, reviewedAt time.Time) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	a, ok := f.appeals[id]
+	if !ok || a.Status != constants.AppealStatusPending {
+		return 0, nil
+	}
+	a.Status = status
+	a.AdminID = &adminID
+	a.ReviewComment = comment
+	a.ReviewedAt = &reviewedAt
+	return 1, nil
+}
+
+func (f *fakeAppealStore) MarkCreditRollback(_ context.Context, id uint, delta int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if a, ok := f.appeals[id]; ok {
+		a.CreditReversed = true
+		a.CreditDelta = delta
+	}
 	return nil
 }
 
@@ -148,7 +171,9 @@ func TestAppealSubmit(t *testing.T) {
 		wantErr  bool
 		wantCode int
 	}{
-		{name: "reviewee submits", user: receiver, reviewID: 10, reason: "评价与事实不符", wantErr: false},
+		{name: "blank spaces rejected", user: receiver, reviewID: 10, reason: "    ", wantErr: true, wantCode: constants.CodeValidation},
+		{name: "tabs and newlines rejected", user: receiver, reviewID: 10, reason: "\t\n  \n", wantErr: true, wantCode: constants.CodeValidation},
+		{name: "reviewee submits", user: receiver, reviewID: 10, reason: "  评价与事实不符  ", wantErr: false},
 		{name: "duplicate appeal rejected", user: receiver, reviewID: 10, reason: "再次申诉", wantErr: true, wantCode: constants.CodeConflict},
 		{name: "reviewer cannot appeal", user: reviewer, reviewID: 10, reason: "我是评价人", wantErr: true, wantCode: constants.CodeForbidden},
 		{name: "review missing", user: receiver, reviewID: 999, reason: "不存在的评价也要有足够长的理由", wantErr: true, wantCode: constants.CodeNotFound},
@@ -171,6 +196,9 @@ func TestAppealSubmit(t *testing.T) {
 			if view.Status != constants.AppealStatusPending {
 				t.Fatalf("expected pending, got %s", view.Status)
 			}
+			if view.Reason != "评价与事实不符" {
+				t.Fatalf("reason must be trimmed, got %q", view.Reason)
+			}
 		})
 	}
 }
@@ -180,24 +208,31 @@ func TestAppealReviewCreditRollback(t *testing.T) {
 		name         string
 		rating       string
 		startScore   int
+		actualDelta  int // delta the review REALLY applied after clamping
 		action       string
 		wantScore    int
 		wantReversed bool
 		wantDelta    int
 		wantStatus   string
 	}{
-		{name: "approve good rolls back +5", rating: constants.ReviewRatingGood, startScore: 105, action: constants.AppealActionApprove, wantScore: 100, wantReversed: true, wantDelta: -5, wantStatus: constants.AppealStatusApproved},
-		{name: "approve bad rolls back -10", rating: constants.ReviewRatingBad, startScore: 90, action: constants.AppealActionApprove, wantScore: 100, wantReversed: true, wantDelta: 10, wantStatus: constants.AppealStatusApproved},
-		{name: "approve medium no credit change", rating: constants.ReviewRatingMedium, startScore: 100, action: constants.AppealActionApprove, wantScore: 100, wantReversed: false, wantDelta: 0, wantStatus: constants.AppealStatusApproved},
-		{name: "reject keeps score", rating: constants.ReviewRatingBad, startScore: 90, action: constants.AppealActionReject, wantScore: 90, wantReversed: false, wantDelta: 0, wantStatus: constants.AppealStatusRejected},
+		{name: "approve good rolls back +5", rating: constants.ReviewRatingGood, startScore: 100, actualDelta: 5, action: constants.AppealActionApprove, wantScore: 100, wantReversed: true, wantDelta: -5, wantStatus: constants.AppealStatusApproved},
+		{name: "approve bad rolls back -10", rating: constants.ReviewRatingBad, startScore: 100, actualDelta: -10, action: constants.AppealActionApprove, wantScore: 100, wantReversed: true, wantDelta: 10, wantStatus: constants.AppealStatusApproved},
+		{name: "approve medium no credit change", rating: constants.ReviewRatingMedium, startScore: 100, actualDelta: 0, action: constants.AppealActionApprove, wantScore: 100, wantReversed: false, wantDelta: 0, wantStatus: constants.AppealStatusApproved},
+		{name: "reject keeps score", rating: constants.ReviewRatingBad, startScore: 100, actualDelta: -10, action: constants.AppealActionReject, wantScore: 90, wantReversed: false, wantDelta: 0, wantStatus: constants.AppealStatusRejected},
+		{name: "floor: bad review applied -4 only, approval restores +4", rating: constants.ReviewRatingBad, startScore: 4, actualDelta: -4, action: constants.AppealActionApprove, wantScore: 4, wantReversed: true, wantDelta: 4, wantStatus: constants.AppealStatusApproved},
+		{name: "floor at zero: bad review changed nothing", rating: constants.ReviewRatingBad, startScore: 0, actualDelta: 0, action: constants.AppealActionApprove, wantScore: 0, wantReversed: false, wantDelta: 0, wantStatus: constants.AppealStatusApproved},
+		{name: "ceiling: good review applied +2 only, approval restores -2", rating: constants.ReviewRatingGood, startScore: 298, actualDelta: 2, action: constants.AppealActionApprove, wantScore: 298, wantReversed: true, wantDelta: -2, wantStatus: constants.AppealStatusApproved},
+		{name: "ceiling at 300: good review changed nothing", rating: constants.ReviewRatingGood, startScore: 300, actualDelta: 0, action: constants.AppealActionApprove, wantScore: 300, wantReversed: false, wantDelta: 0, wantStatus: constants.AppealStatusApproved},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			users := newFakeUserRepo()
-			users.users["13700000002"] = &model.User{ID: 2, Phone: "13700000002", Nickname: "阿珍", Role: constants.UserRoleStudent, CreditScore: tt.startScore}
+			// The review already happened: current score is start+actual (clamped).
+			currentScore := util.ClampCredit(tt.startScore + tt.actualDelta)
+			users.users["13700000002"] = &model.User{ID: 2, Phone: "13700000002", Nickname: "阿珍", Role: constants.UserRoleStudent, CreditScore: currentScore}
 			users.users["13800000001"] = &model.User{ID: 9, Phone: "13800000001", Nickname: "管理员", Role: constants.UserRoleAdmin, CreditScore: 300}
 			reviews := newFakeReviewStore(
-				model.Review{ID: 10, TradeID: 1, ReviewerID: 1, RevieweeID: 2, Rating: tt.rating},
+				model.Review{ID: 10, TradeID: 1, ReviewerID: 1, RevieweeID: 2, Rating: tt.rating, CreditDelta: tt.actualDelta},
 			)
 			appeals := newFakeAppealStore()
 			svc := NewAppealService(appeals, reviews, users, slog.Default())
@@ -223,6 +258,118 @@ func TestAppealReviewCreditRollback(t *testing.T) {
 				t.Fatalf("expected conflict on second review, got %v", err)
 			}
 		})
+	}
+}
+
+func TestAppliedDelta(t *testing.T) {
+	tests := []struct {
+		score, nominal, want int
+	}{
+		{100, 5, 5}, {100, -10, -10}, {4, -10, -4}, {0, -10, 0}, {298, 5, 2}, {300, 5, 0}, {300, -10, -10},
+	}
+	for _, tt := range tests {
+		if got := util.AppliedDelta(tt.score, tt.nominal); got != tt.want {
+			t.Fatalf("AppliedDelta(%d,%d)=%d want %d", tt.score, tt.nominal, got, tt.want)
+		}
+	}
+}
+
+// TestAppealConcurrentSubmit fires N concurrent submits for the same review
+// and requires exactly one success and N-1 business conflicts.
+func TestAppealConcurrentSubmit(t *testing.T) {
+	reviews := newFakeReviewStore(
+		model.Review{ID: 10, TradeID: 1, ReviewerID: 1, RevieweeID: 2, Rating: constants.ReviewRatingBad, CreditDelta: -10},
+	)
+	users := newFakeUserRepo()
+	svc := newAppealTestService(users, reviews, nil)
+	receiver := users.users["13700000002"]
+
+	const n = 20
+	var wg sync.WaitGroup
+	var okN, conflictN, otherN int64
+	var mu sync.Mutex
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := svc.Submit(context.Background(), receiver, &dto.CreateAppealRequest{ReviewID: 10, Reason: "并发申诉理由"})
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil:
+				okN++
+			case appErrCode(err) == constants.CodeConflict:
+				conflictN++
+			default:
+				otherN++
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if okN != 1 || conflictN != n-1 || otherN != 0 {
+		t.Fatalf("want 1 ok / %d conflict / 0 other, got %d/%d/%d", n-1, okN, conflictN, otherN)
+	}
+	list, _ := svc.ListMine(context.Background(), receiver.ID)
+	if len(list) != 1 {
+		t.Fatalf("exactly one appeal row expected, got %d", len(list))
+	}
+}
+
+// TestAppealConcurrentReview fires N concurrent admin decisions and requires
+// exactly one to take effect; the credit rollback happens exactly once.
+func TestAppealConcurrentReview(t *testing.T) {
+	reviews := newFakeReviewStore(
+		model.Review{ID: 10, TradeID: 1, ReviewerID: 1, RevieweeID: 2, Rating: constants.ReviewRatingBad, CreditDelta: -10},
+	)
+	users := newFakeUserRepo()
+	svc := newAppealTestService(users, reviews, nil)
+	receiver := users.users["13700000002"]
+	admin := users.users["13800000001"]
+	scoreBefore := receiver.CreditScore // 120 seeded by newAppealTestService; review applied -10 -> 110
+	receiver.CreditScore = 110
+
+	submitted, err := svc.Submit(context.Background(), receiver, &dto.CreateAppealRequest{ReviewID: 10, Reason: "并发审核理由"})
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	const n = 20
+	var wg sync.WaitGroup
+	var okN, conflictN, otherN int64
+	var mu sync.Mutex
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := svc.Review(context.Background(), admin, submitted.ID, &dto.ReviewAppealRequest{Action: constants.AppealActionApprove})
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil:
+				okN++
+			case appErrCode(err) == constants.CodeConflict:
+				conflictN++
+			default:
+				otherN++
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if okN != 1 || conflictN != n-1 || otherN != 0 {
+		t.Fatalf("want 1 ok / %d conflict / 0 other, got %d/%d/%d", n-1, okN, conflictN, otherN)
+	}
+	// 110 + rollback(+10) = 120 exactly once.
+	if got := users.users["13700000002"].CreditScore; got != scoreBefore {
+		t.Fatalf("rollback must apply once: want %d, got %d", scoreBefore, got)
+	}
+	final, _ := svc.GetProgress(context.Background(), receiver.ID, submitted.ID)
+	if final.Status != constants.AppealStatusApproved || !final.CreditReversed || final.CreditDelta != 10 {
+		t.Fatalf("unexpected final state: %+v", final)
 	}
 }
 

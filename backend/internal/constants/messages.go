@@ -23,7 +23,7 @@ const (
 	MsgAppealNotFound       = "申诉不存在"
 	MsgAppealNotPending     = "该申诉已审核，不可重复审核"
 	MsgAppealNotOwner       = "仅申诉发起人可查询该申诉进度"
-	MsgAppealReasonRequired = "申诉理由不能为空"
+	MsgAppealReasonRequired = "申诉理由不能为空或纯空格（至少 2 个有效字符）"
 	MsgAppealActionInvalid  = "审核动作无效"
 	MsgExchangeClosed       = "该交换已关闭"
 	MsgNoMatch              = "暂未找到匹配的书籍交换"

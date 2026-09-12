@@ -64,6 +64,7 @@ export interface Review {
   reviewee_id: number
   rating: string
   content: string
+  credit_delta: number
   created_at: string
 }
 

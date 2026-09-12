@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -27,14 +28,18 @@ type envelope struct {
 
 func setupEngine(t *testing.T) (*gin.Engine, *gorm.DB) {
 	t.Helper()
-	db, err := gorm.Open(sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared&_busy_timeout=5000"), &gorm.Config{
+	// File-backed WAL database with a real connection pool so concurrent
+	// HTTP requests contend on locks like they would against MySQL (unlike
+	// :memory: with MaxOpenConns=1, which would serialize everything).
+	dsn := "file:" + t.TempDir() + "/e2e.db?_busy_timeout=10000&_journal_mode=WAL"
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{
 		Logger: gormlogger.Default.LogMode(gormlogger.Silent),
 	})
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
 	sqlDB, _ := db.DB()
-	sqlDB.SetMaxOpenConns(1)
+	sqlDB.SetMaxOpenConns(10)
 	t.Cleanup(func() { _ = sqlDB.Close() })
 	if err := db.AutoMigrate(
 		&model.User{}, &model.Product{}, &model.Conversation{}, &model.Message{},
@@ -49,6 +54,9 @@ func setupEngine(t *testing.T) (*gin.Engine, *gorm.DB) {
 		{Phone: "13700000002", PasswordHash: string(hash), Nickname: "卖家阿珍", Role: constants.UserRoleStudent, Campus: "西校区", CreditScore: 120},
 		{Phone: "13700000003", PasswordHash: string(hash), Nickname: "路人达人", Role: constants.UserRoleStudent, Campus: "南校区", CreditScore: 90},
 		{Phone: "13800000001", PasswordHash: string(adminHash), Nickname: "平台管理员", Role: constants.UserRoleAdmin, Campus: "东校区", CreditScore: 300},
+		// Edge accounts for floor/ceiling rollback tests (ids 5 and 6).
+		{Phone: "13700000005", PasswordHash: string(hash), Nickname: "触底卖家", Role: constants.UserRoleStudent, Campus: "东校区", CreditScore: 4},
+		{Phone: "13700000006", PasswordHash: string(hash), Nickname: "触顶卖家", Role: constants.UserRoleStudent, Campus: "东校区", CreditScore: 298},
 	}
 	if err := db.Create(&users).Error; err != nil {
 		t.Fatalf("seed users: %v", err)
@@ -56,6 +64,8 @@ func setupEngine(t *testing.T) (*gin.Engine, *gorm.DB) {
 	products := []model.Product{
 		{SellerID: 2, Title: "差评场景商品", Price: 100, Category: constants.ProductCategoryBooks, Condition: "九成新", Campus: "西校区", TradeLocation: "三食堂", Status: constants.ProductStatusSold},
 		{SellerID: 2, Title: "好评场景商品", Price: 50, Category: constants.ProductCategoryBooks, Condition: "全新", Campus: "西校区", TradeLocation: "三食堂", Status: constants.ProductStatusSold},
+		{SellerID: 5, Title: "触底卖家的商品", Price: 30, Category: constants.ProductCategoryBooks, Condition: "九成新", Campus: "东校区", TradeLocation: "东门", Status: constants.ProductStatusSold},
+		{SellerID: 6, Title: "触顶卖家的商品", Price: 30, Category: constants.ProductCategoryBooks, Condition: "九成新", Campus: "东校区", TradeLocation: "东门", Status: constants.ProductStatusSold},
 	}
 	if err := db.Create(&products).Error; err != nil {
 		t.Fatalf("seed products: %v", err)
@@ -63,6 +73,8 @@ func setupEngine(t *testing.T) (*gin.Engine, *gorm.DB) {
 	orders := []model.TradeOrder{
 		{ProductID: 1, BuyerID: 1, SellerID: 2, Status: constants.TradeStatusCompleted},
 		{ProductID: 2, BuyerID: 1, SellerID: 2, Status: constants.TradeStatusCompleted},
+		{ProductID: 3, BuyerID: 1, SellerID: 5, Status: constants.TradeStatusCompleted},
+		{ProductID: 4, BuyerID: 1, SellerID: 6, Status: constants.TradeStatusCompleted},
 	}
 	if err := db.Create(&orders).Error; err != nil {
 		t.Fatalf("seed orders: %v", err)
@@ -320,6 +332,254 @@ func TestAppealFlowRejected(t *testing.T) {
 	if got := creditOf(t, db, 2); got != 125 {
 		t.Fatalf("after rejection credit must stay 125, got %d", got)
 	}
+}
+
+// TestAppealConcurrentSubmit fires 10 simultaneous POST /appeals for one
+// review and requires exactly one 200, the other nine business conflicts, and
+// a single appeal row in the database.
+func TestAppealConcurrentSubmit(t *testing.T) {
+	r, db := setupEngine(t)
+	buyer := login(t, r, "13700000001", "123456")
+	seller := login(t, r, "13700000002", "123456")
+
+	// Trade 1 has a completed order but no review yet -> create one review first.
+	status, env := doJSON(t, r, http.MethodPost, "/api/v1/reviews", buyer,
+		map[string]interface{}{"trade_id": 1, "rating": "bad", "content": "并发提交申诉前置差评"})
+	mustCode(t, status, env, http.StatusOK, 0, "create review")
+	var review struct {
+		ID uint `json:"id"`
+	}
+	_ = json.Unmarshal(env.Data, &review)
+
+	const n = 10
+	var wg sync.WaitGroup
+	codes := make([]int, n)
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-start
+			body, _ := json.Marshal(map[string]interface{}{
+				"review_id": review.ID, "reason": "并发重复提交的申诉理由必须只有一条成功",
+			})
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/appeals", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+seller)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			codes[idx] = w.Code
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	var ok, conflict int
+	for _, c := range codes {
+		switch c {
+		case http.StatusOK:
+			ok++
+		case http.StatusConflict:
+			conflict++
+		default:
+			t.Fatalf("unexpected http code %d", c)
+		}
+	}
+	if ok != 1 || conflict != n-1 {
+		t.Fatalf("concurrent submit: want 1 ok / %d conflict, got %d / %d", n-1, ok, conflict)
+	}
+	var count int64
+	db.Model(&model.ReviewAppeal{}).Where("review_id = ?", review.ID).Count(&count)
+	if count != 1 {
+		t.Fatalf("exactly one appeal row expected, got %d", count)
+	}
+}
+
+// TestAppealConcurrentReview fires 10 simultaneous admin approvals for one
+// pending appeal and requires exactly one to take effect, with the credit
+// rollback applied exactly once.
+func TestAppealConcurrentReview(t *testing.T) {
+	r, db := setupEngine(t)
+	buyer := login(t, r, "13700000001", "123456")
+	seller := login(t, r, "13700000002", "123456")
+	admin := login(t, r, "13800000001", "admin123")
+
+	status, env := doJSON(t, r, http.MethodPost, "/api/v1/reviews", buyer,
+		map[string]interface{}{"trade_id": 1, "rating": "bad", "content": "并发审核前置差评"})
+	mustCode(t, status, env, http.StatusOK, 0, "create review")
+	var review struct {
+		ID uint `json:"id"`
+	}
+	_ = json.Unmarshal(env.Data, &review)
+	if got := creditOf(t, db, 2); got != 110 {
+		t.Fatalf("score after bad review want 110, got %d", got)
+	}
+
+	status, env = doJSON(t, r, http.MethodPost, "/api/v1/appeals", seller,
+		map[string]interface{}{"review_id": review.ID, "reason": "并发审核的申诉理由需要足够长"})
+	mustCode(t, status, env, http.StatusOK, 0, "submit appeal")
+	var appeal struct {
+		ID uint `json:"id"`
+	}
+	_ = json.Unmarshal(env.Data, &appeal)
+
+	const n = 10
+	var wg sync.WaitGroup
+	codes := make([]int, n)
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-start
+			body, _ := json.Marshal(map[string]interface{}{"action": "approve"})
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/appeals/"+itoa(appeal.ID)+"/review", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+admin)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			codes[idx] = w.Code
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	var ok, conflict int
+	for _, c := range codes {
+		switch c {
+		case http.StatusOK:
+			ok++
+		case http.StatusConflict:
+			conflict++
+		default:
+			t.Fatalf("unexpected http code %d", c)
+		}
+	}
+	if ok != 1 || conflict != n-1 {
+		t.Fatalf("concurrent review: want 1 ok / %d conflict, got %d / %d", n-1, ok, conflict)
+	}
+	// The +10 rollback must have happened exactly once: 110 -> 120.
+	if got := creditOf(t, db, 2); got != 120 {
+		t.Fatalf("rollback must apply once, score want 120, got %d", got)
+	}
+	var a model.ReviewAppeal
+	db.First(&a, appeal.ID)
+	if a.Status != constants.AppealStatusApproved || !a.CreditReversed || a.CreditDelta != 10 {
+		t.Fatalf("unexpected appeal state: %+v", a)
+	}
+}
+
+// TestAppealFloorCeilingRollback verifies that approval restores only the
+// score change the review ACTUALLY caused after [0,300] clamping:
+// at score 4 a bad review applies -4 (restore +4); at 298 a good review
+// applies +2 (restore -2).
+func TestAppealFloorCeilingRollback(t *testing.T) {
+	r, db := setupEngine(t)
+	buyer := login(t, r, "13700000001", "123456")
+	floorSeller := login(t, r, "13700000005", "123456")
+	ceilingSeller := login(t, r, "13700000006", "123456")
+	admin := login(t, r, "13800000001", "admin123")
+
+	// Floor: seller 5 starts at 4; bad review via the real endpoint clamps to 0.
+	status, env := doJSON(t, r, http.MethodPost, "/api/v1/reviews", buyer,
+		map[string]interface{}{"trade_id": 3, "rating": "bad", "content": "触底差评"})
+	mustCode(t, status, env, http.StatusOK, 0, "floor bad review")
+	var badReview struct {
+		ID          uint `json:"id"`
+		CreditDelta int  `json:"credit_delta"`
+	}
+	_ = json.Unmarshal(env.Data, &badReview)
+	if badReview.CreditDelta != -4 {
+		t.Fatalf("actual floor delta want -4, got %d", badReview.CreditDelta)
+	}
+	if got := creditOf(t, db, 5); got != 0 {
+		t.Fatalf("floor score want 0, got %d", got)
+	}
+	status, env = doJSON(t, r, http.MethodPost, "/api/v1/appeals", floorSeller,
+		map[string]interface{}{"review_id": badReview.ID, "reason": "触底差评申诉理由足够长"})
+	mustCode(t, status, env, http.StatusOK, 0, "floor appeal submit")
+	var floorAppeal struct {
+		ID uint `json:"id"`
+	}
+	_ = json.Unmarshal(env.Data, &floorAppeal)
+	status, env = doJSON(t, r, http.MethodPost, "/api/v1/admin/appeals/"+itoa(floorAppeal.ID)+"/review", admin,
+		map[string]interface{}{"action": "approve"})
+	mustCode(t, status, env, http.StatusOK, 0, "floor approve")
+	var floorDecision struct {
+		CreditDelta    int  `json:"credit_delta"`
+		CreditReversed bool `json:"credit_reversed"`
+	}
+	_ = json.Unmarshal(env.Data, &floorDecision)
+	if !floorDecision.CreditReversed || floorDecision.CreditDelta != 4 {
+		t.Fatalf("floor rollback want +4/reversed, got %+v", floorDecision)
+	}
+	if got := creditOf(t, db, 5); got != 4 {
+		t.Fatalf("floor score must restore to 4 (not 10), got %d", got)
+	}
+
+	// Ceiling: seller 6 starts at 298; good review clamps to 300 (actual +2).
+	status, env = doJSON(t, r, http.MethodPost, "/api/v1/reviews", buyer,
+		map[string]interface{}{"trade_id": 4, "rating": "good", "content": "触顶好评"})
+	mustCode(t, status, env, http.StatusOK, 0, "ceiling good review")
+	var goodReview struct {
+		ID          uint `json:"id"`
+		CreditDelta int  `json:"credit_delta"`
+	}
+	_ = json.Unmarshal(env.Data, &goodReview)
+	if goodReview.CreditDelta != 2 {
+		t.Fatalf("actual ceiling delta want +2, got %d", goodReview.CreditDelta)
+	}
+	if got := creditOf(t, db, 6); got != 300 {
+		t.Fatalf("ceiling score want 300, got %d", got)
+	}
+	status, env = doJSON(t, r, http.MethodPost, "/api/v1/appeals", ceilingSeller,
+		map[string]interface{}{"review_id": goodReview.ID, "reason": "触顶好评申诉理由足够长"})
+	mustCode(t, status, env, http.StatusOK, 0, "ceiling appeal submit")
+	var ceilingAppeal struct {
+		ID uint `json:"id"`
+	}
+	_ = json.Unmarshal(env.Data, &ceilingAppeal)
+	status, env = doJSON(t, r, http.MethodPost, "/api/v1/admin/appeals/"+itoa(ceilingAppeal.ID)+"/review", admin,
+		map[string]interface{}{"action": "approve"})
+	mustCode(t, status, env, http.StatusOK, 0, "ceiling approve")
+	var ceilingDecision struct {
+		CreditDelta    int  `json:"credit_delta"`
+		CreditReversed bool `json:"credit_reversed"`
+	}
+	_ = json.Unmarshal(env.Data, &ceilingDecision)
+	if !ceilingDecision.CreditReversed || ceilingDecision.CreditDelta != -2 {
+		t.Fatalf("ceiling rollback want -2/reversed, got %+v", ceilingDecision)
+	}
+	if got := creditOf(t, db, 6); got != 298 {
+		t.Fatalf("ceiling score must restore to 298 (not 295), got %d", got)
+	}
+}
+
+// TestAppealBlankReasonHTTP rejects whitespace-only reasons over HTTP.
+func TestAppealBlankReasonHTTP(t *testing.T) {
+	r, _ := setupEngine(t)
+	buyer := login(t, r, "13700000001", "123456")
+	seller := login(t, r, "13700000002", "123456")
+
+	status, env := doJSON(t, r, http.MethodPost, "/api/v1/reviews", buyer,
+		map[string]interface{}{"trade_id": 1, "rating": "bad", "content": "空格理由前置差评"})
+	mustCode(t, status, env, http.StatusOK, 0, "create review")
+	var review struct {
+		ID uint `json:"id"`
+	}
+	_ = json.Unmarshal(env.Data, &review)
+
+	for _, reason := range []string{"   ", "\t\t", "\n \r\n"} {
+		status, _ := doJSON(t, r, http.MethodPost, "/api/v1/appeals", seller,
+			map[string]interface{}{"review_id": review.ID, "reason": reason})
+		if status != http.StatusBadRequest {
+			t.Fatalf("blank reason %q want 400, got %d", reason, status)
+		}
+	}
+	// A real reason after trimming still works.
+	status, env = doJSON(t, r, http.MethodPost, "/api/v1/appeals", seller,
+		map[string]interface{}{"review_id": review.ID, "reason": "  正常申诉理由  "})
+	mustCode(t, status, env, http.StatusOK, 0, "valid appeal after blank rejects")
 }
 
 func itoa(v uint) string {

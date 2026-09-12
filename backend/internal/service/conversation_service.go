@@ -14,7 +14,7 @@ import (
 
 // ConversationService manages price-negotiation chats between buyer and seller.
 type ConversationService struct {
-	convs *repository.ConversationRepository
+	convs  *repository.ConversationRepository
 	logger *slog.Logger
 }
 

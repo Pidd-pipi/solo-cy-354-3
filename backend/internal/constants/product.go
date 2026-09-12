@@ -3,10 +3,10 @@ package constants
 
 // ProductCategory defines product category enum values shared with the frontend.
 const (
-	ProductCategoryBooks    = "books"
+	ProductCategoryBooks       = "books"
 	ProductCategoryElectronics = "electronics"
-	ProductCategoryDaily    = "daily"
-	ProductCategoryClothing = "clothing"
+	ProductCategoryDaily       = "daily"
+	ProductCategoryClothing    = "clothing"
 )
 
 // ProductCategories lists all valid product categories.
@@ -26,10 +26,10 @@ func IsProductCategory(c string) bool {
 
 // ProductStatus defines product lifecycle states shared with the frontend.
 const (
-	ProductStatusOnSale  = "on_sale"
+	ProductStatusOnSale   = "on_sale"
 	ProductStatusReserved = "reserved"
-	ProductStatusSold    = "sold"
-	ProductStatusRemoved = "removed"
+	ProductStatusSold     = "sold"
+	ProductStatusRemoved  = "removed"
 )
 
 // ProductStatuses lists all valid product statuses.

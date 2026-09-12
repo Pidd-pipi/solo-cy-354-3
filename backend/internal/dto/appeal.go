@@ -7,9 +7,11 @@ import (
 )
 
 // CreateAppealRequest is the payload for appealing a received review.
+// The reason is trimmed and length-checked in the service so that whitespace-
+// only submissions are rejected with a specific business message.
 type CreateAppealRequest struct {
 	ReviewID uint   `json:"review_id" binding:"required"`
-	Reason   string `json:"reason" binding:"required,min=2,max=500"`
+	Reason   string `json:"reason" binding:"required,max=500"`
 }
 
 // ReviewAppealRequest is the admin payload for approving/rejecting an appeal.

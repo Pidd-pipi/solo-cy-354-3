@@ -15,10 +15,10 @@ import (
 
 // ConversationHandler exposes private-message endpoints.
 type ConversationHandler struct {
-	svc     *service.ConversationService
+	svc      *service.ConversationService
 	products *service.ProductService
-	users   *service.UserService
-	logger  *slog.Logger
+	users    *service.UserService
+	logger   *slog.Logger
 }
 
 // NewConversationHandler wires the conversation handler dependencies.

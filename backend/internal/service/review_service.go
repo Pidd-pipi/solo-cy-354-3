@@ -46,13 +46,24 @@ func (s *ReviewService) Create(ctx context.Context, reviewer *model.User, req *d
 		TradeID: req.TradeID, ReviewerID: reviewer.ID, RevieweeID: revieweeID,
 		Rating: req.Rating, Content: req.Content,
 	}
-	delta := util.CreditDelta(req.Rating)
+	nominal := util.CreditDelta(req.Rating)
 	if err := s.reviews.Transaction(ctx, func(txCtx context.Context) error {
 		if _, err := s.reviews.FindByTradeAndReviewer(txCtx, req.TradeID, reviewer.ID); err == nil {
 			return util.ErrConflict
 		} else if !errors.Is(err, util.ErrNotFound) {
 			return err
 		}
+		// Persist the delta that actually takes effect after the [0,300]
+		// clamp so a later appeal rollback restores exactly what changed.
+		delta := nominal
+		if nominal != 0 {
+			reviewee, err := s.users.FindByID(txCtx, revieweeID)
+			if err != nil {
+				return fmt.Errorf("review[trade=%d] reviewee lookup: %w", req.TradeID, err)
+			}
+			delta = util.AppliedDelta(reviewee.CreditScore, nominal)
+		}
+		rv.CreditDelta = delta
 		if err := s.reviews.Create(txCtx, rv); err != nil {
 			return err
 		}
@@ -68,8 +79,8 @@ func (s *ReviewService) Create(ctx context.Context, reviewer *model.User, req *d
 		return nil, util.WrapAppError(fmt.Errorf("review[trade=%d] create: %w", req.TradeID, err), 500, constants.CodeInternalError, constants.MsgInternalError)
 	}
 	s.logger.Info(fmt.Sprintf(constants.LogReviewCreateSuccess, rv.ID, req.TradeID, req.Rating))
-	if delta != 0 {
-		s.logger.Info(fmt.Sprintf(constants.LogCreditUpdateSuccess, revieweeID, delta))
+	if rv.CreditDelta != 0 {
+		s.logger.Info(fmt.Sprintf(constants.LogCreditUpdateSuccess, revieweeID, rv.CreditDelta))
 	}
 	return rv, nil
 }

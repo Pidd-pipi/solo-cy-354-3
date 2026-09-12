@@ -59,7 +59,14 @@ func (f *fakeUserRepo) AddCredit(_ context.Context, id uint, delta int) error {
 	if err != nil {
 		return err
 	}
-	f.users[u.Phone].CreditScore += delta
+	score := u.CreditScore + delta
+	if score < 0 {
+		score = 0
+	}
+	if score > 300 {
+		score = 300
+	}
+	f.users[u.Phone].CreditScore = score
 	return nil
 }
 
