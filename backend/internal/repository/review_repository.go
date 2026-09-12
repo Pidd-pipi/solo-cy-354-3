@@ -37,6 +37,16 @@ func (r *ReviewRepository) FindByTradeAndReviewer(ctx context.Context, tradeID, 
 	return &rv, nil
 }
 
+// FindByID returns the review with the given id.
+func (r *ReviewRepository) FindByID(ctx context.Context, id uint) (*model.Review, error) {
+	var rv model.Review
+	err := db(ctx, r.db).First(&rv, id).Error
+	if err != nil {
+		return nil, normalizeError(err)
+	}
+	return &rv, nil
+}
+
 // ListByReviewee returns reviews received by a user.
 func (r *ReviewRepository) ListByReviewee(ctx context.Context, userID uint) ([]model.Review, error) {
 	var items []model.Review

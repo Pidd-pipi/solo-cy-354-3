@@ -7,7 +7,17 @@ import (
 
 	"github.com/lp/campus-market/internal/util"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
+
+// lockForUpdate applies SELECT ... FOR UPDATE on transactional dialects
+// (MySQL) and is a no-op elsewhere (SQLite tests).
+func lockForUpdate(q *gorm.DB) *gorm.DB {
+	if q.Dialector.Name() == "sqlite" {
+		return q
+	}
+	return q.Clauses(clause.Locking{Strength: "UPDATE"})
+}
 
 // txKey is the context key under which an in-flight transaction lives.
 type txKey struct{}

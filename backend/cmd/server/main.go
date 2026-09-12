@@ -40,7 +40,7 @@ func main() {
 
 	if err := db.AutoMigrate(
 		&model.User{}, &model.Product{}, &model.Conversation{}, &model.Message{},
-		&model.TradeOrder{}, &model.Review{}, &model.BookExchange{},
+		&model.TradeOrder{}, &model.Review{}, &model.BookExchange{}, &model.ReviewAppeal{},
 	); err != nil {
 		logger.Error("auto migrate failed", slog.String("error", err.Error()))
 		os.Exit(1)

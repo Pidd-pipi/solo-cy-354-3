@@ -50,10 +50,23 @@ func (r *UserRepository) UpdateProfile(ctx context.Context, id uint, nickname, a
 		Updates(map[string]interface{}{"nickname": nickname, "avatar": avatar, "campus": campus}).Error
 }
 
-// AddCredit adjusts the credit score by delta.
+// AddCredit adjusts the credit score by delta, clamping the result to [0, 300].
+// It performs a read-modify-write inside the caller's transaction so the
+// rollback used by credit appeals stays portable across SQL dialects.
 func (r *UserRepository) AddCredit(ctx context.Context, id uint, delta int) error {
-	return db(ctx, r.db).Model(&model.User{}).Where("id = ?", id).
-		UpdateColumn("credit_score", gorm.Expr("GREATEST(0, LEAST(300, credit_score + ?))", delta)).Error
+	q := db(ctx, r.db)
+	var u model.User
+	if err := lockForUpdate(q).First(&u, id).Error; err != nil {
+		return normalizeError(err)
+	}
+	score := u.CreditScore + delta
+	if score < 0 {
+		score = 0
+	}
+	if score > 300 {
+		score = 300
+	}
+	return q.Model(&model.User{}).Where("id = ?", id).UpdateColumn("credit_score", score).Error
 }
 
 // Count returns the total number of users.

@@ -141,6 +141,8 @@ cy-354/
   - `POST /api/v1/conversations`、`GET /api/v1/conversations/me`、`GET/POST /api/v1/conversations/:id/messages`
   - `POST /api/v1/trade-orders`、`GET /api/v1/trade-orders/me`、`POST /api/v1/trade-orders/:id/buyer-confirm|seller-confirm|cancel`
   - `POST /api/v1/reviews`、`GET /api/v1/reviews/me`
+  - `POST /api/v1/appeals`、`GET /api/v1/appeals/me`、`GET /api/v1/appeals/:id`
+  - `GET /api/v1/admin/appeals`、`POST /api/v1/admin/appeals/:id/review`（管理员）
   - `GET/POST /api/v1/book-exchanges`、`POST /api/v1/book-exchanges/:id/close`
   - `GET /api/v1/admin/stats`（管理员）
 
@@ -171,12 +173,71 @@ cy-354/
 | POST | `/api/v1/trade-orders/:id/cancel` | 取消订单 | 登录 |
 | POST | `/api/v1/reviews` | 交易后评价（含信誉积分） | 登录 |
 | GET | `/api/v1/reviews/me` | 我收到的评价 | 登录 |
+| POST | `/api/v1/appeals` | 对收到的评价提交信誉申诉（每评价限一次，仅接收方） | 登录 |
+| GET | `/api/v1/appeals/me` | 我的申诉列表与处理进度 | 登录 |
+| GET | `/api/v1/appeals/:id` | 查询单条申诉进度（仅申诉发起人） | 登录 |
+| GET | `/api/v1/admin/appeals` | 申诉队列，可 `?status=pending/approved/rejected` | 管理员 |
+| POST | `/api/v1/admin/appeals/:id/review` | 审核申诉（`approve` 撤销信誉分变化 / `reject` 分数不变） | 管理员 |
 | GET | `/api/v1/book-exchanges` | 书籍交换列表 | 无 |
 | POST | `/api/v1/book-exchanges` | 发布换书请求（自动匹配） | 登录 |
 | POST | `/api/v1/book-exchanges/:id/close` | 关闭换书请求 | 本人 |
 | GET | `/api/v1/admin/stats` | 平台统计占位接口 | 管理员 |
 
+## 信誉申诉模块
+
+业务规则：
+
+- **提交申诉**：只有评价接收方（`reviewee`，即信誉分被改变的一方）可以对自己收到的评价提交申诉；评价人与第三方均返回 403。每条评价只能申诉一次（`review_appeals.review_id` 唯一索引 + 事务内行锁双重保证），重复申诉返回 409。
+- **进度查询**：申诉人可通过 `GET /api/v1/appeals/me` 或 `GET /api/v1/appeals/:id` 查询状态（待审核/已通过/已驳回）、审核备注与信誉分处理结果；非发起人查询单条申诉返回 403。
+- **管理员审核**：管理员在申诉队列中按状态筛选并审核。`approve` 在同一数据库事务内**撤销该评价带来的信誉分变化**（好评 +5 扣回、差评 −10 补回、中评 0 无操作），并记录 `credit_delta`/`credit_reversed` 审计字段；`reject` 不做任何分数变动。已审核申诉不可二次审核（409）。
+
+全栈贯穿文件（实体 ReviewAppeal）：`database/init.sql` → `model/review_appeal.go` → `repository/review_appeal_repository.go` → `service/appeal_service.go` → `handler/appeal_handler.go` → `router/appeals.go` → `frontend/src/api/appeal.ts` → `constants/appeal.ts` → `pages/MyAppeals.vue`（学生提交+进度）/ `pages/AdminAppeals.vue`（管理员审核）。
+
+### 可复现的端到端验证
+
+无需 MySQL/Docker 的真实 HTTP 全链路验证（SQLite 落盘 + 生产同款 Gin 路由/中间件）：
+
+```bash
+# 1) 启动真实 TCP 服务（:29514，自动建表+播种 4 个账号/2 笔已完成订单）
+cd backend/e2e
+rm -f /tmp/e2e_campus.db   # 验证脚本要求全新数据库（脚本本身不做清理）
+go run -tags realserver ./cmd/realserver          # DB_PATH/PORT/JWT_SECRET 可用环境变量覆盖
+
+# 2) 另开终端执行 29 项断言（三条链路 + 权限/唯一性/分数回滚）
+bash backend/e2e/verify_appeal.sh                 # 期望末行 RESULT: PASS=29 FAIL=0
+```
+
+标准 Go 测试（表驱动单测 + httptest 全链路）：
+
+```bash
+cd backend      && go test ./...                  # service/util/repository 表驱动单测
+cd backend/e2e  && go test -run TestAppealFlow -v .  # 真实 Gin 路由 HTTP 端到端
+```
+
+前端：`cd frontend && npm run build && npx tsc --noEmit`（构建与类型检查均零错误），页面入口为导航栏「信誉申诉」（学生）与「申诉审核」（仅管理员可见，路由守卫 `requiresAdmin`）。
+
 ## 枚举出现位置清单
+
+### AppealStatus（pending/approved/rejected）
+
+前端 `frontend/src/constants/appeal.ts`：
+
+- `APPEAL_STATUSES` / `APPEAL_ACTIONS` 常量定义
+- `appealStatusLabel()` / `appealStatusType()` 映射
+- `src/pages/MyAppeals.vue` 进度标签与「申诉/查看进度」按钮显隐
+- `src/pages/AdminAppeals.vue` 状态筛选、通过/驳回按钮显隐
+- `src/router/guards.ts` 管理员页 `requiresAdmin` 守卫
+
+后端 `backend/internal/constants/appeal.go`：
+
+- `AppealStatusPending/Approved/Rejected`、`AppealActionApprove/Reject` 常量
+- `AppealStatuses`、`IsAppealStatus()`、`AppealStatusText()`
+- `backend/internal/model/review_appeal.go` Status 字段
+- `backend/internal/service/appeal_service.go` 提交→审核状态机与信誉分回滚
+- `backend/internal/util/formatters.go` `AppealStatusText()`
+- `backend/internal/constants/log_templates.go` 申诉日志模板（5 条）
+- `backend/internal/constants/messages.go` 申诉提示文案
+- `backend/internal/dto/appeal.go` 审核动作 `oneof=approve reject` 校验
 
 ### ProductStatus（on_sale/reserved/sold/removed）
 

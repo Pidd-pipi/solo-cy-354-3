@@ -17,7 +17,12 @@
         </div>
       </el-card>
       <el-card class="section">
-        <template #header>⭐ 收到的评价</template>
+        <template #header>
+          <div class="reviews-head">
+            <span>⭐ 收到的评价</span>
+            <el-button size="small" type="warning" @click="$router.push('/my-appeals')">信誉申诉 / 进度查询</el-button>
+          </div>
+        </template>
         <el-table :data="reviews">
           <el-table-column prop="id" label="ID" width="80" />
           <el-table-column label="评价">
@@ -101,5 +106,10 @@ onMounted(async () => {
 }
 .section {
   margin-bottom: 16px;
+}
+.reviews-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
 }
 </style>

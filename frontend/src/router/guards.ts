@@ -7,6 +7,9 @@ export function setupGuards(router: Router) {
     if (to.meta.requiresAuth && !authStore.token) {
       return { path: '/login', query: { redirect: to.fullPath } }
     }
+    if (to.meta.requiresAdmin && !authStore.isAdmin()) {
+      return { path: '/products' }
+    }
     return true
   })
 }

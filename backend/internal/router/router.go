@@ -40,6 +40,7 @@ func New(cfg *config.Config, db *gorm.DB, logger *slog.Logger) *gin.Engine {
 	convRepo := repository.NewConversationRepository(db)
 	orderRepo := repository.NewTradeOrderRepository(db)
 	reviewRepo := repository.NewReviewRepository(db)
+	appealRepo := repository.NewReviewAppealRepository(db)
 	exchangeRepo := repository.NewBookExchangeRepository(db)
 
 	// services
@@ -48,6 +49,7 @@ func New(cfg *config.Config, db *gorm.DB, logger *slog.Logger) *gin.Engine {
 	convSvc := service.NewConversationService(convRepo, logger)
 	orderSvc := service.NewTradeOrderService(orderRepo, productRepo, logger)
 	reviewSvc := service.NewReviewService(reviewRepo, orderRepo, userRepo, logger)
+	appealSvc := service.NewAppealService(appealRepo, reviewRepo, userRepo, logger)
 	exchangeSvc := service.NewBookExchangeService(exchangeRepo, logger)
 
 	// handlers
@@ -56,6 +58,7 @@ func New(cfg *config.Config, db *gorm.DB, logger *slog.Logger) *gin.Engine {
 	convH := handler.NewConversationHandler(convSvc, productSvc, userSvc, logger)
 	orderH := handler.NewTradeOrderHandler(orderSvc, userSvc, logger)
 	reviewH := handler.NewReviewHandler(reviewSvc, userSvc, logger)
+	appealH := handler.NewAppealHandler(appealSvc, userSvc, logger)
 	exchangeH := handler.NewBookExchangeHandler(exchangeSvc, logger)
 
 	auth := middleware.AuthRequired(cfg.JWTSecret, logger)
@@ -70,6 +73,8 @@ func New(cfg *config.Config, db *gorm.DB, logger *slog.Logger) *gin.Engine {
 		RegisterConversationRoutes(v1, convH, auth, apiLimiter)
 		RegisterTradeOrderRoutes(v1, orderH, auth, apiLimiter)
 		RegisterReviewRoutes(v1, reviewH, auth, apiLimiter)
+		RegisterAppealRoutes(v1, appealH, auth, apiLimiter)
+		RegisterAdminAppealRoutes(v1, appealH, auth, requireAdmin, apiLimiter)
 		RegisterBookExchangeRoutes(v1, exchangeH, auth, apiLimiter)
 		// admin-only report handling placeholder route group (kept for RBAC coverage)
 		admin := v1.Group("/admin", auth, requireAdmin)

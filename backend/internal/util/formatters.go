@@ -46,3 +46,8 @@ func CreditLevelText(score int) string {
 func CategoryText(c string) string {
 	return constants.ProductCategoryText(c)
 }
+
+// AppealStatusText maps an appeal status to its Chinese label.
+func AppealStatusText(s string) string {
+	return constants.AppealStatusText(s)
+}

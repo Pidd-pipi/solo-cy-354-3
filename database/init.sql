@@ -77,8 +77,27 @@ CREATE TABLE IF NOT EXISTS reviews (
   rating VARCHAR(16) NOT NULL,
   content TEXT,
   created_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
-  INDEX idx_reviews_trade (trade_id),
+  UNIQUE KEY uniq_review_trade_reviewer (trade_id, reviewer_id),
   INDEX idx_reviews_reviewee (reviewee_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 信誉申诉：每条评价只能申诉一次（review_id 唯一键）；审核通过时按原评分反向回滚信誉分
+CREATE TABLE IF NOT EXISTS review_appeals (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  review_id BIGINT UNSIGNED NOT NULL,
+  appellant_id BIGINT UNSIGNED NOT NULL,
+  reason TEXT NOT NULL,
+  status VARCHAR(16) NOT NULL DEFAULT 'pending',
+  admin_id BIGINT UNSIGNED NULL,
+  review_comment TEXT,
+  credit_reversed TINYINT(1) NOT NULL DEFAULT 0,
+  credit_delta INT NOT NULL DEFAULT 0,
+  reviewed_at DATETIME(3) NULL,
+  created_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
+  UNIQUE KEY uniq_appeal_review (review_id),
+  INDEX idx_appeals_appellant (appellant_id),
+  INDEX idx_appeals_status (status),
+  INDEX idx_appeals_admin (admin_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS book_exchanges (

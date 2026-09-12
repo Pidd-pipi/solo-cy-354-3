@@ -67,6 +67,22 @@ export interface Review {
   created_at: string
 }
 
+export interface ReviewAppeal {
+  id: number
+  review_id: number
+  appellant_id: number
+  appellant_name: string
+  reason: string
+  status: string
+  admin_id: number | null
+  review_comment: string
+  credit_reversed: boolean
+  credit_delta: number
+  reviewed_at: string | null
+  created_at: string
+  review?: Review
+}
+
 export interface BookExchange {
   id: number
   user_id: number
