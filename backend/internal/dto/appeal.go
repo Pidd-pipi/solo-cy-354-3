@@ -39,13 +39,14 @@ type AppealView struct {
 
 // ReviewView is the embedded review snapshot inside an appeal view.
 type ReviewView struct {
-	ID         uint      `json:"id"`
-	TradeID    uint      `json:"trade_id"`
-	ReviewerID uint      `json:"reviewer_id"`
-	RevieweeID uint      `json:"reviewee_id"`
-	Rating     string    `json:"rating"`
-	Content    string    `json:"content"`
-	CreatedAt  time.Time `json:"created_at"`
+	ID          uint      `json:"id"`
+	TradeID     uint      `json:"trade_id"`
+	ReviewerID  uint      `json:"reviewer_id"`
+	RevieweeID  uint      `json:"reviewee_id"`
+	Rating      string    `json:"rating"`
+	Content     string    `json:"content"`
+	CreditDelta int       `json:"credit_delta"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 // NewReviewView maps a review model to its API projection.
@@ -54,12 +55,13 @@ func NewReviewView(rv *model.Review) *ReviewView {
 		return nil
 	}
 	return &ReviewView{
-		ID:         rv.ID,
-		TradeID:    rv.TradeID,
-		ReviewerID: rv.ReviewerID,
-		RevieweeID: rv.RevieweeID,
-		Rating:     rv.Rating,
-		Content:    rv.Content,
-		CreatedAt:  rv.CreatedAt,
+		ID:          rv.ID,
+		TradeID:     rv.TradeID,
+		ReviewerID:  rv.ReviewerID,
+		RevieweeID:  rv.RevieweeID,
+		Rating:      rv.Rating,
+		Content:     rv.Content,
+		CreditDelta: rv.CreditDelta,
+		CreatedAt:   rv.CreatedAt,
 	}
 }

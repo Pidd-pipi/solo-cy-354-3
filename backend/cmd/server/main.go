@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/lp/campus-market/internal/config"
+	"github.com/lp/campus-market/internal/migration"
 	"github.com/lp/campus-market/internal/model"
 	"github.com/lp/campus-market/internal/router"
 	"github.com/lp/campus-market/internal/util"
@@ -43,6 +44,11 @@ func main() {
 		&model.TradeOrder{}, &model.Review{}, &model.BookExchange{}, &model.ReviewAppeal{},
 	); err != nil {
 		logger.Error("auto migrate failed", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+
+	if err := migration.Run(context.Background(), db, logger); err != nil {
+		logger.Error("data migration failed", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
 

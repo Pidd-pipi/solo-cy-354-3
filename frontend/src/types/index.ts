@@ -67,7 +67,6 @@ export interface Review {
   credit_delta: number
   created_at: string
 }
-
 export interface ReviewAppeal {
   id: number
   review_id: number

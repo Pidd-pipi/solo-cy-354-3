@@ -226,6 +226,23 @@ cd backend      && go test ./...                  # service/util/repository 表�
 cd backend/e2e  && go test -run TestAppealFlow -v .  # 真实 Gin 路由 HTTP 端到端
 ```
 
+#### 旧库升级（存量评价回填实际增量）
+
+引入 `reviews.credit_delta` 之前的存量评价在 AutoMigrate 加列后默认是 0，若直接申诉会导致回滚量为 0。启动序列（`cmd/server/main.go`，与 SQLite 验证程序一致）在 AutoMigrate 之后执行版本化数据迁移 `internal/migration`：
+
+- `schema_migrations` 表记录已应用版本，回填只执行一次，重启幂等；
+- v1 `backfill_review_credit_delta`：以注册基线 100 分，按每个被评价人的评价历史顺序（id 升序）重放名义增量并套用 [0,300] 钳制，为每条存量评价重建**实际生效**的增量。因此旧差评申诉通过后恢复的是评价发生前的分数（含触底/触顶只部分生效的评价），完全被钳制的评价增量为 0，回滚为 no-op；
+- 回滚始终依据重建出的 `reviews.credit_delta`，与新库在线写入的语义完全一致。
+
+旧库升级真实接口演练（自动完成：旧表造数 → 新二进制启动回填 → HTTP 申诉审核 → 重启验证幂等）：
+
+```bash
+cd backend/e2e && bash verify_legacy_upgrade.sh   # 期望末行 LEGACY RESULT: PASS=22 FAIL=0
+go test -run 'TestLegacyDatabaseUpgradeBackfill|TestNewDatabaseMatchesUpgradedBehavior' -v .
+```
+
+演练覆盖：普通旧差评 90→申诉通过恢复 100；连续 11 条差评触底（第 11 条实际增量 0），第 10 条申诉恢复 0→10；连续 41 条好评触顶，第 40 条申诉恢复 300→295；二次启动不重复回填、已回填增量不丢失。
+
 前端：`cd frontend && npm run build && npx tsc --noEmit`（构建与类型检查均零错误），页面入口为导航栏「信誉申诉」（学生）与「申诉审核」（仅管理员可见，路由守卫 `requiresAdmin`）。
 
 ## 枚举出现位置清单
